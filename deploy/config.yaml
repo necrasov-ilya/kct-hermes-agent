@@ -1,0 +1,40 @@
+# KCT 24-12 hermes agent profile
+model:
+  default: z-ai/glm-5.3-flash
+  provider: openrouter
+  # GLM-5.3-flash is natively multimodal (OpenRouter catalog: text+image+video);
+  # belt-and-braces in case the local metadata mirror lacks the entry yet.
+  supports_vision: true
+
+agent:
+  image_input_mode: auto
+
+providers:
+  openrouter:
+    name: OpenRouter
+    transport: chat_completions
+    key_env: OPENROUTER_API_KEY
+
+schedule:
+  group: "ИТ24-12"
+  url: "https://portal.it-college.ru/schedule25.php"
+  direct_json_url: ""
+  subgroup: "*"
+  refresh_hours: 6
+
+terminal:
+  backend: local
+  timeout: 180
+
+gateway:
+  platforms:
+    telegram:
+      enabled: true
+      bot_token_env: TELEGRAM_BOT_TOKEN
+      extra:
+        # Every group message reaches the agent; the persona prompt answers
+        # with the exact silence token when there is nothing to say.
+        require_mention: false
+        # Uncomment and fill to restrict which chats the bot serves:
+        # allowed_chats:
+        #   - "-1001234567890"

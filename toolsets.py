@@ -70,6 +70,8 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
+    # University group schedule (gated on schedule.group config via check_fn)
+    "school_schedule",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is
@@ -136,6 +138,17 @@ TOOLSETS = {
     "video": {
         "description": "Video analysis and understanding tools (opt-in, not in default toolset)",
         "tools": ["video_analyze"],
+        "includes": []
+    },
+
+    "school": {
+        "description": (
+            "University group schedule tool (weekly schedule from the college "
+            "portal). Enabled in config via `schedule.group` (group code, e.g. "
+            "ИТ24-12); optional `schedule.url`, `schedule.subgroup`, "
+            "`schedule.refresh_hours`."
+        ),
+        "tools": ["school_schedule"],
         "includes": []
     },
     
