@@ -506,7 +506,13 @@ def _format_lesson(lesson: Dict[str, Any], profile: str = "") -> Optional[str]:
     lesson = _lesson_for_profile(lesson, profile)
     if lesson is None:
         return None
-    line = f"{lesson.get('time', '')} — {lesson.get('subject', '')}".strip(" –")
+    subject = lesson.get("subject") or ""
+    line = f"{lesson.get('time', '')} — {subject}".strip(" –")
+    # A row that was titled generically ("ПрофПредмет") and carries no
+    # per-profile subgroup is a whole-group lesson — say so instead of
+    # making the model guess whose it is.
+    if subject in ("ПрофПредмет", "Профпредмет") and not lesson.get("profiles"):
+        line += " (вся группа)"
     if lesson.get("room"):
         line += f", каб. {lesson['room']}"
     if lesson.get("subgroups"):
@@ -582,7 +588,12 @@ SCHOOL_SCHEDULE_SCHEMA = {
         "full week (optionally one day), what='today' classes for today, "
         "what='next' the next lessons after the current time. week_offset: 0 = "
         "current week, 1 = next week. group: any group from the portal; omit it "
-        "to use the configured default."
+        "to use the configured default. profile: narrow to one study profile "
+        "(BE/FE/GD/PM/SA/CD); groups can hold several profiles in one slot.\n"
+        "FORMAT the reply as a compact day-by-day list: day name, then each "
+        "lesson as `time — subject (каб. N)`. Keep it short, no prose around. "
+        "If the tool says a lesson applies to the whole group (marked "
+        "'вся группа'), do not invent a profile — state it is for everyone."
     ),
     "parameters": {
         "type": "object",

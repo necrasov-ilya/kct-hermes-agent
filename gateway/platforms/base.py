@@ -135,15 +135,16 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics.
 
-    Telegram forum/supergroup topics should be routed by topic metadata, not by
-    replying to the triggering message. Hermes-created Telegram private-chat
-    topic lanes prefer replying to the triggering user message so the answer
-    stays attached to the active lane; synthetic/resumed sends fall back to
-    ``direct_messages_topic_id`` metadata when no message id is available.
+    Telegram forum/supergroup topics are routed to the right topic via the
+    ``message_thread_id`` metadata, and the reply anchor adds a reply to the
+    specific triggering message inside that topic. Hermes-created Telegram
+    private-chat topic lanes prefer replying to the triggering user message so
+    the answer stays attached to the active lane; synthetic/resumed sends fall
+    back to ``direct_messages_topic_id`` metadata when no message id is
+    available.
     """
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))
-    thread_id = getattr(source, "thread_id", None)
     raw_message = getattr(event, "raw_message", None)
     if (
         platform == "slack"
@@ -156,14 +157,13 @@ def _reply_anchor_for_event(event) -> str | None:
         # SlackAdapter._resolve_thread_ts() treat it as a thread anchor and
         # reply in a (nonexistent) thread anyway.
         return None
-    if platform == "telegram" and thread_id and getattr(source, "chat_type", None) == "dm":
-        # Reply to the triggering user message. Replying to Telegram's earlier
-        # topic seed/anchor can render the bot response outside the active lane.
+    if platform == "telegram":
+        # Reply to the triggering user message. In forum topics the
+        # message_thread_id metadata still routes the answer to the correct
+        # topic; the anchor only makes it a visible reply to the specific
+        # message. For private DM topic lanes this keeps the answer attached
+        # to the active lane instead of an older topic seed/anchor.
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
-    if platform == "telegram" and thread_id:
-        return None
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)
 
 
