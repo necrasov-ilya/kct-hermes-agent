@@ -71,6 +71,11 @@ DAY_RU_FULL = {
     "sunday": "Воскресенье",
 }
 
+# Профильные подгруппы портала (SGrID → label). Не путать с уровнями
+# английского (A1.31, B1.31…) и номерами подгрупп (Подгр1…) — это профили
+# подготовки: BackEnd, FrontEnd, GameDev, ProjectMan, SysAdmin, UX/UI.
+PROFILE_CODES = {"BE", "FE", "GD", "PM", "SA", "CD"}
+
 # Matches array-of-objects JSON blobs embedded in HTML (e.g. inside <script>).
 _JS_ARRAY_RE = re.compile(r"\[(?:\s*\{[\s\S]*?\}\s*,?\s*)+\]")
 
@@ -324,25 +329,62 @@ def _normalize_events(raw: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any
             sub_items: List[str] = []
             sub_rooms: List[str] = []
             sg = entry.get("SubGroup")
+            subject_override = ""
+            # SGrID -> {"subject": …, "room": …} for profile-tracked subgroups.
+            profiles: Dict[str, Dict[str, str]] = {}
             if isinstance(sg, list):
-                for sub in sg:
-                    if not isinstance(sub, dict):
-                        continue
-                    sgrid = str(sub.get("SGrID", "")).strip()
-                    stitle = str(sub.get("STitle", "")).strip()
-                    sroom = str(sub.get("SGCaID", "")).strip()
-                    piece = (
-                        f"{sgrid}: " if sgrid else ""
-                    ) + stitle + (f" каб.{sroom}" if sroom else "")
-                    piece = piece.strip()
-                    if piece:
-                        sub_items.append(piece)
-                    if sroom:
-                        sub_rooms.append(sroom)
-                subgroups = sub_items
-                uniq_rooms = sorted({r for r in sub_rooms if r})
-                if not item_room and len(uniq_rooms) == 1:
-                    item_room = uniq_rooms[0]
+                subs = [sub for sub in sg if isinstance(sub, dict)]
+                titles = [str(sub.get("STitle", "")).strip() for sub in subs]
+                titles = [t for t in titles if t]
+                uniq_titles = sorted({t for t in titles})
+                base_title = str(entry.get("title", "")).strip()
+                subs_by_profile = {str(sub.get("SGrID", "")).strip(): sub for sub in subs}
+                for sgrid, sub in subs_by_profile.items():
+                    if sgrid in PROFILE_CODES:
+                        profiles[sgrid] = {
+                            "subject": str(sub.get("STitle", "")).strip() or base_title,
+                            "room": str(sub.get("SGCaID", "")).strip() or item_room,
+                        }
+                if uniq_titles and len(uniq_titles) == 1 and uniq_titles[0] != base_title:
+                    # The portal titles these rows generically ("ПрофПредмет")
+                    # while the real subject lives in the subgroup STitle.
+                    # Name the lesson by it instead of the bucket label.
+                    subject_override = uniq_titles[0]
+                    pieces: List[str] = []
+                    for sub in subs:
+                        sgrid = str(sub.get("SGrID", "")).strip()
+                        sroom = str(sub.get("SGCaID", "")).strip()
+                        piece = sgrid + (f" каб.{sroom}" if sroom else "")
+                        if piece:
+                            pieces.append(piece)
+                        if sroom:
+                            sub_rooms.append(sroom)
+                    subgroups = list(dict.fromkeys(pieces))
+                    uniq_rooms = sorted({r for r in sub_rooms if r})
+                    if len(uniq_rooms) == 1:
+                        item_room = item_room or uniq_rooms[0]
+                        subgroups = [p.split(" каб.", 1)[0] for p in subgroups]
+                else:
+                    for sub in subs:
+                        sgrid = str(sub.get("SGrID", "")).strip()
+                        stitle = str(sub.get("STitle", "")).strip()
+                        sroom = str(sub.get("SGCaID", "")).strip()
+                        if stitle and stitle == base_title:
+                            # Subgroup title repeats the lesson title; keep label short.
+                            piece = sgrid + (f" каб.{sroom}" if sroom else "")
+                        else:
+                            piece = (
+                                f"{sgrid}: " if sgrid else ""
+                            ) + stitle + (f" каб.{sroom}" if sroom else "")
+                        piece = piece.strip()
+                        if piece:
+                            sub_items.append(piece)
+                        if sroom:
+                            sub_rooms.append(sroom)
+                    subgroups = sub_items
+                    uniq_rooms = sorted({r for r in sub_rooms if r})
+                    if not item_room and len(uniq_rooms) == 1:
+                        item_room = uniq_rooms[0]
             elif isinstance(entry.get("subgroups"), list):
                 subgroups = [str(s).strip() for s in entry.get("subgroups") if str(s).strip()]
             else:
@@ -363,9 +405,10 @@ def _normalize_events(raw: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any
             by_day[weekday].append(
                 {
                     "time": time_str,
-                    "subject": str(entry.get("title", "")).strip(),
+                    "subject": subject_override or str(entry.get("title", "")).strip(),
                     "room": item_room,
                     "subgroups": subgroups,
+                    "profiles": profiles,
                 }
             )
         except (ValueError, TypeError, AttributeError):
@@ -437,7 +480,32 @@ async def _get_week(week_offset: int, settings: Dict[str, Any]) -> Dict[str, Any
         raise
 
 
-def _format_lesson(lesson: Dict[str, Any]) -> str:
+def _lesson_for_profile(lesson: Dict[str, Any], profile: str) -> Optional[Dict[str, Any]]:
+    """Return the lesson narrowed to one profile, or None when it doesn't match.
+
+    Lessons without profile-tracked subgroups (general subjects, English levels,
+    subgroup numbers) are always kept. Profile-tracked lessons show only the
+    matching subgroup's subject/room.
+    """
+    if not profile:
+        return lesson
+    profiles = lesson.get("profiles") or {}
+    if not profiles:
+        return lesson
+    entry = profiles.get(profile)
+    if entry is None:
+        return None
+    out = dict(lesson)
+    out["subject"] = entry.get("subject") or lesson.get("subject")
+    out["room"] = entry.get("room") or lesson.get("room")
+    out["subgroups"] = [profile]
+    return out
+
+
+def _format_lesson(lesson: Dict[str, Any], profile: str = "") -> Optional[str]:
+    lesson = _lesson_for_profile(lesson, profile)
+    if lesson is None:
+        return None
     line = f"{lesson.get('time', '')} — {lesson.get('subject', '')}".strip(" –")
     if lesson.get("room"):
         line += f", каб. {lesson['room']}"
@@ -446,11 +514,12 @@ def _format_lesson(lesson: Dict[str, Any]) -> str:
     return line
 
 
-def _format_week(week: Dict[str, Any]) -> str:
+def _format_week(week: Dict[str, Any], profile: str = "") -> str:
     days = week.get("days", {})
     if not any(days.get(k) for k in WEEKDAY_KEYS.values()):
         return f"Расписание на неделю {week['monday']} пустое или недоступно (группа {week.get('group', '')})."
-    lines = [f"Группа {week.get('group', '')}, неделя с {week['monday']}."]
+    profile_note = f" (профиль {profile})" if profile else ""
+    lines = [f"Группа {week.get('group', '')}, неделя с {week['monday']}{profile_note}."]
     if week.get("stale"):
         lines.append("Внимание: портал не ответил, показано закешированное расписание.")
     for key in (WEEKDAY_KEYS[k] for k in range(7)):
@@ -458,31 +527,40 @@ def _format_week(week: Dict[str, Any]) -> str:
         head = f"{DAY_RU[key]} {DAY_RU_FULL[key][:0] or ''}".strip()
         lines.append("")
         lines.append(head)
-        if not lessons:
+        formatted = [l for l in (_format_lesson(x, profile) for x in lessons) if l]
+        if not formatted:
+            if profile:
+                # Day exists but has no lessons for this profile — keep it silent only
+                # if there were no lessons at all; otherwise skip the day.
+                if lessons:
+                    continue
             lines.append("— выходной")
             continue
-        for lesson in lessons:
-            lines.append(_format_lesson(lesson))
+        lines.extend(formatted)
     return "\n".join(lines)
 
 
-def _today_lessons(week: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return week.get("days", {}).get(WEEKDAY_KEYS[datetime.now().weekday()], [])
+def _today_lessons(week: Dict[str, Any], profile: str = "") -> List[Dict[str, Any]]:
+    lessons = week.get("days", {}).get(WEEKDAY_KEYS[datetime.now().weekday()], [])
+    return [l for l in (_lesson_for_profile(x, profile) for x in lessons) if l]
 
 
-def _next_lessons(week: Dict[str, Any]) -> str:
+def _next_lessons(week: Dict[str, Any], profile: str = "") -> str:
     now = datetime.now()
     today_lessons = week.get("days", {}).get(WEEKDAY_KEYS[now.weekday()], [])
     upcoming = []
     for lesson in today_lessons:
-        start = lesson.get("time", "").split("–")[0].strip()
+        narrowed = _lesson_for_profile(lesson, profile)
+        if narrowed is None:
+            continue
+        start = narrowed.get("time", "").split("–")[0].strip()
         try:
             hh, mm = start.split(":")
             start_dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
         except ValueError:
             continue
         if start_dt > now:
-            upcoming.append(lesson)
+            upcoming.append(narrowed)
         if len(upcoming) >= 3:
             break
     if not upcoming:
@@ -498,10 +576,13 @@ SCHOOL_SCHEDULE_SCHEMA = {
     "description": (
         "Class schedule for the configured university group (fetched from the "
         "college portal). Use it for questions about classes this week or today "
-        "and what lesson is next. what='week' returns the full week (optionally "
-        "one day), what='today' classes for today, what='next' the next lessons "
-        "after the current time. week_offset: 0 = current week, 1 = next week. "
-        "group: any group from the portal; omit it to use the configured default."
+        "and what lesson is next. This is the ONLY way to get the schedule: the "
+        "portal requires a login and is NOT reachable via website tools or the "
+        "terminal — do not check the portal yourself. what='week' returns the "
+        "full week (optionally one day), what='today' classes for today, "
+        "what='next' the next lessons after the current time. week_offset: 0 = "
+        "current week, 1 = next week. group: any group from the portal; omit it "
+        "to use the configured default."
     ),
     "parameters": {
         "type": "object",
@@ -523,6 +604,11 @@ SCHOOL_SCHEDULE_SCHEMA = {
             "group": {
                 "type": "string",
                 "description": "Group name as shown on the portal (e.g. 'ИТ24-11'). Defaults to the configured group when omitted.",
+            },
+            "profile": {
+                "type": "string",
+                "enum": ["BE", "FE", "GD", "PM", "SA", "CD"],
+                "description": "Optional study profile to narrow the schedule to. Profiles are subgroup codes on the portal: BE (BackEnd), FE (FrontEnd), GD (GameDev), PM (ProjectMan), SA (SysAdmin), CD (UX/UI). Different students in one group can have different profiles, so the same time slot may hold different subjects per profile. Omit to show the whole group.",
             },
         },
     },
@@ -552,6 +638,10 @@ async def _handle_schedule(args: Dict[str, Any], **kw: Any) -> str:
         settings = dict(settings)
         settings["group"] = group_arg
 
+    profile_arg = str(args.get("profile") or "").strip().upper()
+    if profile_arg and profile_arg not in PROFILE_CODES:
+        return tool_error(f"unknown profile {profile_arg!r}; use one of {sorted(PROFILE_CODES)}")
+
     try:
         week = await _get_week(week_offset, settings)
     except Exception as e:
@@ -565,19 +655,29 @@ async def _handle_schedule(args: Dict[str, Any], **kw: Any) -> str:
                 return tool_error(f"unknown day {day!r}")
             lessons = days.get(day, [])
             header = f"Группа {week.get('group', '')}, {DAY_RU_FULL[day].lower()} (неделя с {week['monday']})."
+            if profile_arg:
+                header += f" Профиль {profile_arg}."
             if not lessons:
                 return f"{header}\n— выходной."
-            lines = [header] + [_format_lesson(l) for l in lessons]
+            lines = [header]
+            for l in lessons:
+                line = _format_lesson(l, profile_arg)
+                if line:
+                    lines.append(line)
+            if not lines[1:]:
+                return f"{header}\n— выходной."
             if week.get("stale"):
                 lines.append("(данные из кэша, портал не ответил)")
             return "\n".join(lines)
-        return _format_week(week)
+        return _format_week(week, profile_arg)
 
     if what == "today":
         if week_offset != 0:
             return tool_error("what='today' only makes sense for week_offset=0")
-        lessons = _today_lessons(week)
+        lessons = _today_lessons(week, profile_arg)
         header = f"Группа {week.get('group', '')}, сегодня {DAY_RU_FULL[WEEKDAY_KEYS[datetime.now().weekday()]].lower()}."
+        if profile_arg:
+            header += f" Профиль {profile_arg}."
         if not lessons:
             return f"{header}\n— выходной."
         lines = [header] + [_format_lesson(l) for l in lessons]
@@ -585,7 +685,7 @@ async def _handle_schedule(args: Dict[str, Any], **kw: Any) -> str:
             lines.append("(данные из кэша, портал не ответил)")
         return "\n".join(lines)
 
-    return _next_lessons(week)
+    return _next_lessons(week, profile_arg)
 
 
 registry.register(
