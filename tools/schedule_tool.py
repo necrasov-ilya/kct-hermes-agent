@@ -76,30 +76,47 @@ _JS_ARRAY_RE = re.compile(r"\[(?:\s*\{[\s\S]*?\}\s*,?\s*)+\]")
 
 
 def _cache_path():
-    from hermes_constants import get_hermes_dir
+    from hermes_constants import get_hermes_home
 
-    return get_hermes_dir() / "schedule_cache.json"
+    return get_hermes_home() / "schedule_cache.json"
 
 
 def _schedule_settings() -> Dict[str, Any]:
-    """Read the schedule.* config block. Returns {} when unconfigured."""
+    """Read the schedule.* config block plus portal credentials from .env.
+
+    Credentials live in <hermes_home>/.env (STUDENTS_USERNAME /
+    STUDENTS_PASSWORD), never in config.yaml or source. Returns {} when
+    unconfigured.
+    """
     try:
         from hermes_cli.config import cfg_get, load_config
 
         cfg = load_config()
         group = str(cfg_get(cfg, "schedule", "group") or "").strip()
         url = str(cfg_get(cfg, "schedule", "url") or "").strip() or DEFAULT_URL
+        login_url = str(cfg_get(cfg, "schedule", "login_url") or "").strip()
         direct_url = str(cfg_get(cfg, "schedule", "direct_json_url") or "").strip()
         subgroup = str(cfg_get(cfg, "schedule", "subgroup") or "").strip() or "*"
         refresh_hours = float(cfg_get(cfg, "schedule", "refresh_hours") or 6)
         if not group:
             return {}
+        username = str(os.getenv("STUDENTS_USERNAME") or "").strip()
+        password = str(os.getenv("STUDENTS_PASSWORD") or "").strip()
+        # Ready-made session cookie value (STDNT-login-user=...&STDNT-login-pw=...)
+        session = str(os.getenv("STUDENTS_SESSION") or "").strip()
+        if not username and not session:
+            # Credentials are required to reach the schedule behind the login.
+            return {}
         return {
             "group": group,
             "url": url,
+            "login_url": login_url,
             "direct_json_url": direct_url,
             "subgroup": subgroup,
             "refresh_hours": max(refresh_hours, 0.25),
+            "username": username,
+            "password": password,
+            "session": session,
         }
     except Exception:
         return {}
@@ -110,13 +127,72 @@ def check_schedule_requirements() -> bool:
     return bool(_schedule_settings())
 
 
+# Process-local session cookie cache (portal sessions survive a while; a 302
+# mid-flight forces a re-login and cache refresh).
+_SESSION_COOKIE: Dict[str, str] = {}
+
+
+async def _login(settings: Dict[str, Any]) -> str:
+    """POST the portal login form and return the session cookie value.
+
+    Returns 'session=<STDNT-login-user=...&STDNT-login-pw=...>' — the exact
+    header the portal issues on a successful dologin.html submit. Raises
+    RuntimeError on failure.
+    """
+    # Ready-made cookie from .env (STUDENTS_SESSION) — no login round-trip.
+    if settings.get("session"):
+        return f"session={settings['session']}"
+
+    login_url = settings.get("login_url") or "https://students.it-college.ru/dologin.html"
+    username = settings.get("username") or ""
+    password = settings.get("password") or ""
+    if not username:
+        raise RuntimeError("portal credentials missing: set STUDENTS_USERNAME/STUDENTS_PASSWORD in .env")
+
+    data = {"httpd_username": username, "httpd_password": password}
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=False) as client:
+            resp = await client.post(
+                login_url,
+                data=data,
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "ru-RU,ru;q=0.8,en;q=0.5"},
+            )
+    except Exception as e:
+        raise RuntimeError(f"login request to {login_url} failed: {e}") from e
+
+    for k, v in resp.headers.items():
+        if k.lower() == "set-cookie":
+            for part in v.split(","):
+                part = part.strip()
+                if part.lower().startswith("session=") and ";" in part:
+                    return part.split(";", 1)[0]
+    # Some proxies collapse Set-Cookie into a single header — accept it whole.
+    cookie = resp.headers.get("set-cookie", "")
+    if cookie.strip().lower().startswith("session="):
+        return cookie.split(";", 1)[0]
+    raise RuntimeError(
+        f"login failed: expected a session cookie, got HTTP {resp.status_code} "
+        f"(redirect: {resp.headers.get('location', '-')})"
+    )
+
+
+async def _session_cookie(settings: Dict[str, Any]) -> str:
+    """Return the portal session cookie, logging in once per process."""
+    cookie = _SESSION_COOKIE.get(settings["url"])
+    if cookie:
+        return cookie
+    cookie = await _login(settings)
+    _SESSION_COOKIE[settings["url"]] = cookie
+    return cookie
+
+
 async def _fetch_events(settings: Dict[str, Any], monday: datetime) -> List[Dict[str, Any]]:
     """POST the portal endpoint and return raw event dicts for the week.
 
-    Tries the configured ``url`` first, then the optional ``direct_json_url``
-    fallback, then the default portal URL (deduplicated). This survives the
-    known case where the portal 404s the PHP endpoint on some networks while a
-    mirror/fresh URL works, and vice versa.
+    The endpoint sits behind a login: we obtain the session cookie first and
+    send it with the request. A 302 (expired session) triggers one re-login
+    and retry. Survives the known case where a mirror/fresh URL works while
+    another 404s, and vice versa.
     """
     week_start = monday
     week_end = monday + timedelta(days=6)
@@ -131,63 +207,82 @@ async def _fetch_events(settings: Dict[str, Any], monday: datetime) -> List[Dict
         if candidate and candidate not in url_order:
             url_order.append(candidate)
 
-    async def _post(url: str, verify: bool):
+    payload = {
+        "group": settings["group"],
+        "subgroup": settings["subgroup"],
+        "d_start": broad_start,
+        "d_end": broad_end,
+    }
+    headers = {
+        "Content-Type": "application/json;charset=utf-8",
+        "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    async def _post(url: str, cookie: str, verify: bool):
+        h = dict(headers)
+        if cookie:
+            h["Cookie"] = cookie
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, verify=verify) as client:
-            return await client.post(url, headers=headers, json=payload)
+            return await client.post(url, headers=h, json=payload)
 
     text = ""
     last_error = "no schedule url available"
     for url in url_order:
-        payload = {
-            "group": settings["group"],
-            "subgroup": settings["subgroup"],
-            "d_start": broad_start,
-            "d_end": broad_end,
-        }
-        headers = {
-            "Content-Type": "application/json;charset=utf-8",
-            "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
-            "User-Agent": "Mozilla/5.0",
-        }
         try:
-            resp = await _post(url, True)
-        except httpx.ConnectError:
-            # Broken TLS chain: retry without verification.
+            cookie = await _session_cookie(settings)
+        except RuntimeError as e:
+            last_error = str(e)
+            continue
+        for attempt in range(2):  # second attempt = re-login after 302
             try:
-                resp = await _post(url, False)
+                resp = await _post(url, cookie, True)
+            except httpx.ConnectError:
+                # Broken TLS chain: retry without verification.
+                try:
+                    resp = await _post(url, cookie, False)
+                except Exception as e:
+                    last_error = f"connect to {url} failed: {e}"
+                    break
             except Exception as e:
                 last_error = f"connect to {url} failed: {e}"
+                break
+            if resp.status_code == 302:
+                # Session expired (or login never landed): refresh once.
+                _SESSION_COOKIE.pop(url, None)
+                try:
+                    cookie = await _session_cookie(settings)
+                except RuntimeError as e:
+                    last_error = str(e)
+                    break
                 continue
-        except Exception as e:
-            last_error = f"connect to {url} failed: {e}"
-            continue
-        if resp.status_code != 200:
-            last_error = f"{url} returned HTTP {resp.status_code}"
-            continue
+            if resp.status_code != 200:
+                last_error = f"{url} returned HTTP {resp.status_code}"
+                break
 
-        text = resp.text or ""
-
-        # 1) Direct JSON body.
-        try:
-            data = resp.json()
-            events = data if isinstance(data, list) else []
-            week_events = _filter_events_to_week(events, week_start, week_end)
-            if week_events is not None:
-                return week_events
-        except Exception:
-            pass
-
-        # 2) JSON array embedded in HTML (<script> or raw text).
-        for candidate in _JS_ARRAY_RE.findall(text):
+            text = resp.text or ""
+            # 1) Direct JSON body.
             try:
-                arr = json.loads(candidate)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if isinstance(arr, list) and arr and isinstance(arr[0], dict):
-                if any("start" in e or "title" in e for e in arr if isinstance(e, dict)):
-                    return _filter_events_to_week(arr, week_start, week_end)
+                data = resp.json()
+                events = data if isinstance(data, list) else []
+                week_events = _filter_events_to_week(events, week_start, week_end)
+                if week_events is not None:
+                    return week_events
+            except Exception:
+                pass
 
-        last_error = f"{url} returned 200 but no parsable events were found"
+            # 2) JSON array embedded in HTML (<script> or raw text).
+            for candidate in _JS_ARRAY_RE.findall(text):
+                try:
+                    arr = json.loads(candidate)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                    if any("start" in e or "title" in e for e in arr if isinstance(e, dict)):
+                        return _filter_events_to_week(arr, week_start, week_end)
+
+            last_error = f"{url} returned 200 but no parsable events were found"
+            break
 
     raise RuntimeError(last_error)
 
@@ -305,22 +400,24 @@ async def _get_week(week_offset: int, settings: Dict[str, Any]) -> Dict[str, Any
     """
     now = datetime.now()
     monday = (now - timedelta(days=now.weekday())) + timedelta(weeks=week_offset)
+    group = settings["group"]
+    cache_key = f"{monday.strftime('%Y-%m-%d')}|{group}"
 
     cache = _load_cache()
-    entry = cache.get(monday.strftime("%Y-%m-%d"))
+    entry = cache.get(cache_key)
     if entry and isinstance(entry.get("days"), dict):
         fetched_at = float(entry.get("fetched_at", 0))
         if time.time() - fetched_at < settings["refresh_hours"] * 3600:
             return {
                 "monday": monday.strftime("%Y-%m-%d"),
-                "group": entry.get("group", settings["group"]),
+                "group": entry.get("group", group),
                 "days": entry["days"],
             }
 
     try:
         raw = await _fetch_events(settings, monday)
         days = _normalize_events(raw)
-        cache[monday.strftime("%Y-%m-%d")] = {
+        cache[cache_key] = {
             "group": settings["group"],
             "fetched_at": time.time(),
             "days": days,
@@ -403,7 +500,8 @@ SCHOOL_SCHEDULE_SCHEMA = {
         "college portal). Use it for questions about classes this week or today "
         "and what lesson is next. what='week' returns the full week (optionally "
         "one day), what='today' classes for today, what='next' the next lessons "
-        "after the current time. week_offset: 0 = current week, 1 = next week."
+        "after the current time. week_offset: 0 = current week, 1 = next week. "
+        "group: any group from the portal; omit it to use the configured default."
     ),
     "parameters": {
         "type": "object",
@@ -421,6 +519,10 @@ SCHOOL_SCHEDULE_SCHEMA = {
                 "type": "string",
                 "enum": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
                 "description": "Optional: only this day of the week (only used with what='week').",
+            },
+            "group": {
+                "type": "string",
+                "description": "Group name as shown on the portal (e.g. 'ИТ24-11'). Defaults to the configured group when omitted.",
             },
         },
     },
@@ -443,6 +545,12 @@ async def _handle_schedule(args: Dict[str, Any], **kw: Any) -> str:
         return tool_error(f"week_offset must be an integer, got {args.get('week_offset')!r}")
     if what == "next" and week_offset != 0:
         return tool_error("what='next' only makes sense for week_offset=0")
+
+    # Model may name any portal group; default is the configured one.
+    group_arg = str(args.get("group") or "").strip()
+    if group_arg:
+        settings = dict(settings)
+        settings["group"] = group_arg
 
     try:
         week = await _get_week(week_offset, settings)

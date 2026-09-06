@@ -17,7 +17,8 @@ providers:
 
 schedule:
   group: "ИТ24-12"
-  url: "https://portal.it-college.ru/schedule25.php"
+  url: "https://students.it-college.ru/Schedule/schedule26.php"
+  login_url: "https://students.it-college.ru/dologin.html"
   direct_json_url: ""
   subgroup: "*"
   refresh_hours: 6
@@ -38,3 +39,10 @@ gateway:
         # Uncomment and fill to restrict which chats the bot serves:
         # allowed_chats:
         #   - "-1001234567890"
+# Busy input handling: a follow-up while the agent is working redirects the
+# live turn and folds the correction into the same request (one merged turn),
+# instead of interrupting or queueing a separate turn. All busy ack bubbles
+# (⚡/⏳/⏩/↪) are suppressed — silence is the correct signal here.
+display:
+  busy_input_mode: interrupt
+  busy_ack_enabled: false

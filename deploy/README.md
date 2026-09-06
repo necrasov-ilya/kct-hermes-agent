@@ -18,12 +18,14 @@ on the server and are NOT part of this repo.
 5. Add the bot to the 24-12 group (admin: disable privacy mode via BotFather,
    or add it to `group_allow_from`/`allowed_chats` in config.yaml).
 
-## Known quirks (as of 2026-08-27)
-- The portal endpoint `schedule25.php` 404s from external IPs (our dev box);
-  it works from the college network (SEORA was built on it). On the server,
-  if the schedule tool reports a fetch error, either the server is on the
-  college network (fine) or set `schedule.direct_json_url` / `schedule.url`
-  to a working URL that accepts the same JSON body.
+## Known quirks (as of 2026-09-06)
+- The old public endpoint `portal.it-college.ru/schedule25.php` is dead
+  ("Портал на ремонте!"); schedules now live behind the student-portal login
+  at `students.it-college.ru/Schedule/schedule26.php`. The tool logs in
+  through `schedule.login_url` with credentials read from `.env`
+  (`STUDENTS_USERNAME` / `STUDENTS_PASSWORD`; or `STUDENTS_SESSION` for a
+  pre-made session-cookie value). Credentials never live in config.yaml or
+  source.
 - GLM-5.3-flash on OpenRouter is validated for text + image (vision) turns.
 - macOS dev boxes may see "SQLite 3.50.4 WAL bug" warnings — harmless;
   server Linux distros are typically on 3.51+.
